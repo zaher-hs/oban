@@ -73,6 +73,7 @@ defmodule Oban.Plugins.Pruner do
 
   defp delete_jobs(conf, _seconds, limit, outdated) do
     outdated_at = DateTime.add(DateTime.utc_now(), -outdated)
+
     subquery =
       Job
       |> where([j], j.state in ["completed", "discarded"])
