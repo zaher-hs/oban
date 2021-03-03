@@ -72,6 +72,11 @@ defmodule Oban.Job do
           unsaved_error: %{kind: atom(), reason: term(), stacktrace: Exception.stacktrace()}
         }
 
+  @type changeset :: Ecto.Changeset.t(t())
+  @type changeset_fun :: (map() -> changeset())
+  @type changeset_list :: [changeset()]
+  @type changeset_list_fun :: (map() -> changeset_list())
+
   schema "oban_jobs" do
     field :state, :string, default: "available"
     field :queue, :string, default: "default"
@@ -197,6 +202,9 @@ defmodule Oban.Job do
     |> validate_length(:worker, min: 1, max: 128)
     |> validate_number(:max_attempts, greater_than: 0)
     |> validate_number(:priority, greater_than: -1, less_than: 4)
+    |> check_constraint(:attempt, name: :attempt_range)
+    |> check_constraint(:max_attempts, name: :positive_max_attempts)
+    |> check_constraint(:priority, name: :priority_range)
   end
 
   @unique_fields ~w(args queue worker)a

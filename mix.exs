@@ -1,20 +1,20 @@
 defmodule Oban.MixProject do
   use Mix.Project
 
-  @version "2.3.3"
+  @version "2.5.0"
 
   def project do
     [
       app: :oban,
       version: @version,
-      elixir: "~> 1.8",
+      elixir: "~> 1.9",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
       preferred_cli_env: [
         bench: :test,
-        ci: :test,
+        "test.ci": :test,
         "test.setup": :test
       ],
 
@@ -35,12 +35,14 @@ defmodule Oban.MixProject do
       name: "Oban",
       docs: [
         main: "Oban",
+        logo: "assets/oban-logo.png",
         source_ref: "v#{@version}",
         source_url: "https://github.com/sorentwo/oban",
         extra_section: "GUIDES",
         formatters: ["html"],
         extras: extras() ++ pro_extras() ++ web_extras(),
-        groups_for_extras: groups_for_extras()
+        groups_for_extras: groups_for_extras(),
+        groups_for_modules: groups_for_modules()
       ]
     ]
   end
@@ -58,11 +60,15 @@ defmodule Oban.MixProject do
   defp extras do
     [
       "CHANGELOG.md",
+
+      # Guides
       "guides/installation.md",
       "guides/troubleshooting.md",
+      "guides/release_configuration.md",
       "guides/writing_plugins.md",
       "guides/upgrading/v2.0.md",
-      "guides/release_configuration.md",
+
+      # Recipes
       "guides/recipes/recursive-jobs.md",
       "guides/recipes/reliable-scheduling.md",
       "guides/recipes/reporting-progress.md",
@@ -94,6 +100,8 @@ defmodule Oban.MixProject do
       [
         "../oban_web/guides/web/overview.md": [filename: "web_overview"],
         "../oban_web/guides/web/installation.md": [filename: "web_installation"],
+        "../oban_web/guides/web/customizing.md": [filename: "web_customizing"],
+        "../oban_web/guides/web/telemetry.md": [filename: "web_telemetry"],
         "../oban_web/guides/web/troubleshooting.md": [filename: "web_troubleshooting"],
         "../oban_web/CHANGELOG.md": [filename: "web-changelog", title: "Changelog"]
       ]
@@ -106,10 +114,26 @@ defmodule Oban.MixProject do
     [
       Guides: ~r{guides/[^\/]+\.md},
       Recipes: ~r{guides/recipes/.?},
-      Extras: ~r{^CHANGELOG.md},
       "Upgrade Guides": ~r{guides/upgrading/.*},
       "Oban Pro": ~r{oban_pro/.?},
       "Oban Web": ~r{oban_web/.?}
+    ]
+  end
+
+  defp groups_for_modules do
+    [
+      Plugins: [
+        Oban.Plugins.Cron,
+        Oban.Plugins.Pruner,
+        Oban.Plugins.Repeater,
+        Oban.Plugins.Stager
+      ],
+      Extending: [
+        Oban.Config,
+        Oban.Notifier,
+        Oban.Registry,
+        Oban.Repo
+      ]
     ]
   end
 
@@ -120,7 +144,8 @@ defmodule Oban.MixProject do
       links: %{
         Website: "https://getoban.pro",
         Changelog: "https://github.com/sorentwo/oban/blob/master/CHANGELOG.md",
-        GitHub: "https://github.com/sorentwo/oban"
+        GitHub: "https://github.com/sorentwo/oban",
+        Sponsor: "https://getoban.pro"
       }
     ]
   end
@@ -136,8 +161,7 @@ defmodule Oban.MixProject do
       {:benchee, "~> 1.0", only: [:test, :dev], runtime: false},
       {:credo, "~> 1.4", only: [:test, :dev], runtime: false},
       {:dialyxir, "~> 1.0", only: [:test, :dev], runtime: false},
-      {:ex_doc, "~> 0.20", only: [:test, :dev], runtime: false},
-      {:nimble_parsec, "~> 1.0", only: [:test, :dev], runtime: false, override: true}
+      {:ex_doc, "~> 0.20", only: [:test, :dev], runtime: false}
     ]
   end
 
@@ -145,8 +169,9 @@ defmodule Oban.MixProject do
     [
       bench: "run bench/bench_helper.exs",
       "test.setup": ["ecto.create", "ecto.migrate"],
-      ci: [
+      "test.ci": [
         "format --check-formatted",
+        "deps.unlock --check-unused",
         "credo --strict",
         "test --raise",
         "dialyzer"

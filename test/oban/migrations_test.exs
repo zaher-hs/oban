@@ -1,9 +1,9 @@
-defmodule Oban.Integration.MigratingTest do
-  use Oban.Case
+defmodule Oban.MigrationsTest do
+  use Oban.Case, async: true
 
   import Oban.Migrations, only: [initial_version: 0, current_version: 0, migrated_version: 2]
 
-  @moduletag :integration
+  @arbitrary_checks 20
 
   defmodule StepMigration do
     use Ecto.Migration
@@ -44,6 +44,7 @@ defmodule Oban.Integration.MigratingTest do
       Application.put_env(:oban, :up_version, up)
 
       assert :ok = Ecto.Migrator.up(Repo, @base_version + up, StepMigration)
+      assert migrated_version() == up
     end
 
     assert table_exists?("oban_jobs")
@@ -87,20 +88,15 @@ defmodule Oban.Integration.MigratingTest do
     clear_migrated()
   end
 
-  test "migrating up arbitrary versions" do
-    for up_1 <- 1..current_version(), up_2 <- 1..current_version() do
-      Application.put_env(:oban, :up_version, up_1)
-      assert :ok = Ecto.Migrator.up(Repo, @base_version, StepMigration)
-
-      Application.put_env(:oban, :up_version, up_2)
-      assert :ok = Ecto.Migrator.up(Repo, @base_version + 1, StepMigration)
-
-      clear_migrated()
-    end
-  end
-
   test "migrating up and down between arbitrary versions" do
-    for up <- 2..current_version(), down <- 1..(current_version() - 1) do
+    ups = 2..current_version()
+    dns = 1..(current_version() - 1)
+
+    ups
+    |> Enum.zip(dns)
+    |> Enum.shuffle()
+    |> Enum.take(@arbitrary_checks)
+    |> Enum.each(fn {up, down} ->
       Application.put_env(:oban, :up_version, up)
       Application.put_env(:oban, :down_version, down)
 
@@ -108,7 +104,7 @@ defmodule Oban.Integration.MigratingTest do
       assert :ok = Ecto.Migrator.down(Repo, @base_version, StepMigration)
 
       clear_migrated()
-    end
+    end)
   end
 
   defp migrated_version do

@@ -25,6 +25,7 @@ defmodule Oban.Queue.Executor do
           kind: any(),
           meta: map(),
           queue_time: integer(),
+          result: term(),
           start_mono: integer(),
           start_time: integer(),
           stop_mono: integer(),
@@ -41,6 +42,7 @@ defmodule Oban.Queue.Executor do
     :error,
     :job,
     :meta,
+    :result,
     :snooze,
     :start_mono,
     :start_time,
@@ -167,10 +169,10 @@ defmodule Oban.Queue.Executor do
   defp perform_inline(%{worker: worker, job: job} = exec) do
     case worker.perform(job) do
       :ok ->
-        %{exec | state: :success}
+        %{exec | state: :success, result: :ok}
 
-      {:ok, _result} ->
-        %{exec | state: :success}
+      {:ok, _value} = result ->
+        %{exec | state: :success, result: result}
 
       :discard ->
         %{exec | state: :discard, error: PerformError.exception({worker, :discard})}
@@ -211,6 +213,9 @@ defmodule Oban.Queue.Executor do
   defp perform_timed(exec, timeout) do
     task = Task.async(fn -> perform_inline(exec) end)
 
+    # Stash the timed task's pid to facilitate sending it messages via telemetry events.
+    Process.put(:"$nested", [task.pid])
+
     case Task.yield(task, timeout) || Task.shutdown(task) do
       {:ok, reply} ->
         reply
@@ -228,14 +233,24 @@ defmodule Oban.Queue.Executor do
   defp execute_stop(exec) do
     measurements = %{duration: exec.duration, queue_time: exec.queue_time}
 
-    Telemetry.execute([:oban, :job, :stop], measurements, exec.meta)
+    meta =
+      exec.meta
+      |> Map.put(:state, exec.state)
+      |> Map.put(:result, exec.result)
+
+    Telemetry.execute([:oban, :job, :stop], measurements, meta)
   end
 
   defp execute_exception(exec) do
     measurements = %{duration: exec.duration, queue_time: exec.queue_time}
 
     meta =
-      Map.merge(exec.meta, %{kind: exec.kind, error: exec.error, stacktrace: exec.stacktrace})
+      Map.merge(exec.meta, %{
+        kind: exec.kind,
+        error: exec.error,
+        stacktrace: exec.stacktrace,
+        state: exec.state
+      })
 
     Telemetry.execute([:oban, :job, :exception], measurements, meta)
   end
@@ -243,6 +258,7 @@ defmodule Oban.Queue.Executor do
   defp event_metadata(conf, job) do
     job
     |> Map.take([:id, :args, :queue, :worker, :attempt, :max_attempts, :tags])
+    |> Map.put(:conf, conf)
     |> Map.put(:job, job)
     |> Map.put(:prefix, conf.prefix)
   end

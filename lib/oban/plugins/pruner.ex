@@ -1,11 +1,47 @@
 defmodule Oban.Plugins.Pruner do
-  @moduledoc false
+  @moduledoc """
+  Periodically delete completed, cancelled and discarded jobs based on age.
+
+  ## Using the Plugin
+
+  The following example demonstrates using the plugin without any configuration, which will prune
+  jobs older than the default of 60 seconds:
+
+      config :my_app, Oban,
+        plugins: [Oban.Plugins.Pruner],
+        ...
+
+  Override the default options to prune jobs after 5 minutes:
+
+      config :my_app, Oban,
+        plugins: [{Oban.Plugins.Pruner, max_age: 300}],
+        ...
+
+  ## Options
+
+  * `:max_age` — the number of seconds after which a job may be pruned
+  * `:limit` — the maximum number of jobs to prune at one time. The default is 10,000 to prevent
+    request timeouts. Applications that steadily generate more than 10k jobs a minute should increase
+    this value.
+
+  ## Instrumenting with Telemetry
+
+  The `Oban.Plugins.Pruner` plugin adds the following metadata to the `[:oban, :plugin, :stop]` event:
+
+  * :pruned_count - the number of jobs that were pruned from the database
+  """
 
   use GenServer
 
-  import Ecto.Query
+  import Ecto.Query, only: [join: 5, limit: 2, select: 2, where: 3]
 
-  alias Oban.{Job, Query, Repo, Telemetry}
+  alias Oban.{Config, Job, Query, Repo}
+
+  @type option ::
+          {:conf, Config.t()}
+          | {:name, GenServer.name()}
+          | {:limit, pos_integer()}
+          | {:max_age, pos_integer()}
 
   defmodule State do
     @moduledoc false
@@ -18,15 +54,14 @@ defmodule Oban.Plugins.Pruner do
       outdated: 60,
       interval: :timer.seconds(30),
       limit: 10_000,
-      lock_key: 1_159_969_450_252_858_340
+      lock_key: 1_149_979_440_242_868_002
     ]
   end
 
-  @spec start_link(Keyword.t()) :: GenServer.on_start()
+  @doc false
+  @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
-    name = Keyword.get(opts, :name, __MODULE__)
-
-    GenServer.start_link(__MODULE__, opts, name: name)
+    GenServer.start_link(__MODULE__, opts, name: opts[:name])
   end
 
   @impl GenServer
@@ -49,9 +84,20 @@ defmodule Oban.Plugins.Pruner do
   end
 
   @impl GenServer
-  def handle_info(:prune, %State{conf: conf} = state) do
-    Telemetry.span(:prune, fn ->
-      Repo.transaction(conf, fn -> acquire_and_prune(state) end)
+  def handle_info(:prune, %State{} = state) do
+    meta = %{conf: state.conf, plugin: __MODULE__}
+
+    :telemetry.span([:oban, :plugin], meta, fn ->
+      case lock_and_delete_jobs(state) do
+        {:ok, {pruned_count, _}} when is_integer(pruned_count) ->
+          {:ok, Map.put(meta, :pruned_count, pruned_count)}
+
+        {:ok, false} ->
+          {:ok, Map.put(meta, :pruned_count, 0)}
+
+        error ->
+          {:error, Map.put(meta, :error, error)}
+      end
     end)
 
     {:noreply, schedule_prune(state)}
@@ -59,19 +105,19 @@ defmodule Oban.Plugins.Pruner do
 
   # Scheduling
 
+  defp lock_and_delete_jobs(state) do
+    Query.with_xact_lock(state.conf, state.lock_key, fn ->
+      delete_jobs(state.conf, state.max_age, state.limit, state.outdated)
+    end)
+  end
+
   defp schedule_prune(state) do
     %{state | timer: Process.send_after(self(), :prune, state.interval)}
   end
 
   # Query
 
-  defp acquire_and_prune(state) do
-    if Query.acquire_lock?(state.conf, state.lock_key) do
-      delete_jobs(state.conf, state.max_age, state.limit, state.outdated)
-    end
-  end
-
-  defp delete_jobs(conf, _seconds, limit, outdated) do
+  defp delete_jobs(conf, seconds, limit,outdated) do
     outdated_at = DateTime.add(DateTime.utc_now(), -outdated)
 
     subquery =

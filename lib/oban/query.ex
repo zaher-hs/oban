@@ -7,6 +7,8 @@ defmodule Oban.Query do
   alias Ecto.{Changeset, Multi}
   alias Oban.{Config, Job, Repo}
 
+  @type lock_key :: pos_integer()
+
   @spec fetch_available_jobs(Config.t(), binary(), binary(), pos_integer()) :: {:ok, [Job.t()]}
   def fetch_available_jobs(%Config{node: node} = conf, queue, nonce, demand) do
     subset =
@@ -39,27 +41,32 @@ defmodule Oban.Query do
     )
   end
 
-  @spec fetch_or_insert_job(Config.t(), Changeset.t()) :: {:ok, Job.t()} | {:error, term()}
+  @spec fetch_or_insert_job(Config.t(), Job.changeset()) :: {:ok, Job.t()} | {:error, term()}
   def fetch_or_insert_job(conf, changeset) do
     fun = fn -> insert_unique(conf, changeset) end
     with {:ok, result} <- Repo.transaction(conf, fun), do: result
   end
 
-  @spec fetch_or_insert_job(Config.t(), Multi.t(), Multi.name(), fun() | Changeset.t()) ::
+  @spec fetch_or_insert_job(
+          Config.t(),
+          Multi.t(),
+          Multi.name(),
+          Job.changeset() | Job.changeset_fun()
+        ) ::
           Multi.t()
-  def fetch_or_insert_job(config, multi, name, fun) when is_function(fun, 1) do
+  def fetch_or_insert_job(conf, multi, name, fun) when is_function(fun, 1) do
     Multi.run(multi, name, fn repo, changes ->
-      insert_unique(%{config | repo: repo}, fun.(changes))
+      insert_unique(%{conf | repo: repo}, fun.(changes))
     end)
   end
 
-  def fetch_or_insert_job(config, multi, name, changeset) do
+  def fetch_or_insert_job(conf, multi, name, changeset) do
     Multi.run(multi, name, fn repo, _changes ->
-      insert_unique(%{config | repo: repo}, changeset)
+      insert_unique(%{conf | repo: repo}, changeset)
     end)
   end
 
-  @spec insert_all_jobs(Config.t(), [Changeset.t(Job.t())]) :: [Job.t()]
+  @spec insert_all_jobs(Config.t(), Job.changeset_list()) :: [Job.t()]
   def insert_all_jobs(%Config{} = conf, changesets) when is_list(changesets) do
     entries = Enum.map(changesets, &Job.to_map/1)
 
@@ -69,31 +76,22 @@ defmodule Oban.Query do
     end
   end
 
-  @spec insert_all_jobs(Config.t(), Multi.t(), Multi.name(), [Changeset.t()]) :: Multi.t()
-  def insert_all_jobs(config, multi, name, changesets) when is_list(changesets) do
+  @spec insert_all_jobs(
+          Config.t(),
+          Multi.t(),
+          Multi.name(),
+          Job.changeset_list() | Job.changeset_list_fun()
+        ) :: Multi.t()
+  def insert_all_jobs(conf, multi, name, changesets) when is_list(changesets) do
     Multi.run(multi, name, fn repo, _changes ->
-      {:ok, insert_all_jobs(%{config | repo: repo}, changesets)}
+      {:ok, insert_all_jobs(%{conf | repo: repo}, changesets)}
     end)
   end
 
-  @spec stage_scheduled_jobs(Config.t(), binary(), opts :: keyword()) :: {:ok, {integer(), nil}}
-  def stage_scheduled_jobs(%Config{} = conf, queue, opts \\ []) do
-    max_scheduled_at = Keyword.get(opts, :max_scheduled_at, utc_now())
-
-    subset =
-      Job
-      |> select([j], j.id)
-      |> where([j], j.state in ["scheduled", "retryable"])
-      |> where([j], j.queue == ^queue)
-      |> where([j], j.scheduled_at <= ^max_scheduled_at)
-      |> lock("FOR UPDATE SKIP LOCKED")
-
-    Repo.transaction(
-      conf,
-      fn ->
-        Repo.update_all(conf, where(Job, [j], j.id in subquery(subset)), set: [state: "available"])
-      end
-    )
+  def insert_all_jobs(conf, multi, name, changesets_fun) when is_function(changesets_fun, 1) do
+    Multi.run(multi, name, fn repo, changes ->
+      {:ok, insert_all_jobs(%{conf | repo: repo}, changesets_fun.(changes))}
+    end)
   end
 
   @spec complete_job(Config.t(), Job.t()) :: :ok
@@ -117,28 +115,26 @@ defmodule Oban.Query do
     ]
 
     Repo.update_all(conf, where(Job, id: ^job.id), updates)
+
     :ok
   end
 
-  @cancellable_states ~w(available scheduled retryable)
-
-  @spec cancel_job(Config.t(), pos_integer() | Job.t()) :: :ok | :ignored
+  @spec cancel_job(Config.t(), pos_integer() | Job.t()) :: :ok
   def cancel_job(%Config{} = conf, %Job{id: id}) do
-    updates = [set: [state: "cancelled", cancelled_at: utc_now()]]
-
-    Repo.update_all(conf, where(Job, id: ^id), updates)
-
-    :ok
+    cancel_job(conf, id)
   end
 
   def cancel_job(%Config{} = conf, job_id) do
-    query = where(Job, [j], j.id == ^job_id and j.state in @cancellable_states)
+    query =
+      Job
+      |> where([j], j.id == ^job_id)
+      |> where([j], j.state not in ["completed", "discarded", "cancelled"])
+
     updates = [set: [state: "cancelled", cancelled_at: utc_now()]]
 
-    case Repo.update_all(conf, query, updates) do
-      {1, nil} -> :ok
-      {0, nil} -> :ignored
-    end
+    Repo.update_all(conf, query, updates)
+
+    :ok
   end
 
   @spec snooze_job(Config.t(), Job.t(), pos_integer()) :: :ok
@@ -151,6 +147,7 @@ defmodule Oban.Query do
     ]
 
     Repo.update_all(conf, where(Job, id: ^id), updates)
+
     :ok
   end
 
@@ -193,26 +190,18 @@ defmodule Oban.Query do
     ]
 
     Repo.update_all(conf, where(Job, id: ^id), updates)
-    :ok
-  end
-
-  @spec notify(Config.t(), binary(), map()) :: :ok
-  def notify(%Config{prefix: prefix} = conf, channel, %{} = payload) when is_binary(channel) do
-    Repo.query(
-      conf,
-      "SELECT pg_notify($1, $2)",
-      ["#{prefix}.#{channel}", Jason.encode!(payload)]
-    )
 
     :ok
   end
 
-  @spec acquire_lock?(Config.t(), pos_integer()) :: boolean()
-  def acquire_lock?(%Config{} = conf, lock_key) do
-    case acquire_lock(conf, lock_key) do
-      :ok -> true
-      {:error, :locked} -> false
-    end
+  @spec with_xact_lock(Config.t(), lock_key(), fun()) :: {:ok, any()} | {:error, any()}
+  def with_xact_lock(%Config{} = conf, lock_key, fun) when is_function(fun, 0) do
+    Repo.transaction(conf, fn ->
+      case acquire_lock(conf, lock_key) do
+        :ok -> fun.()
+        _er -> false
+      end
+    end)
   end
 
   # Helpers
@@ -274,12 +263,18 @@ defmodule Oban.Query do
 
   defp unique_query(_changeset), do: nil
 
-  defp unique_field({changeset, :args, [_ | _] = keys}, acc) do
+  defp unique_field({changeset, :args, keys}, acc) do
     args =
-      changeset
-      |> Changeset.get_field(:args)
-      |> Map.new(fn {key, val} -> {to_string(key), val} end)
-      |> Map.take(keys)
+      case keys do
+        [] ->
+          Changeset.get_field(changeset, :args)
+
+        [_ | _] ->
+          changeset
+          |> Changeset.get_field(:args)
+          |> Map.new(fn {key, val} -> {to_string(key), val} end)
+          |> Map.take(keys)
+      end
 
     dynamic([j], fragment("? @> ?", j.args, ^args) and ^acc)
   end

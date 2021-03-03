@@ -3,7 +3,7 @@ defmodule Oban.Integration.TelemetryTest do
 
   import ExUnit.CaptureLog
 
-  alias Oban.{PerformError, Telemetry}
+  alias Oban.{Config, PerformError, Telemetry}
 
   @moduletag :integration
 
@@ -19,6 +19,24 @@ defmodule Oban.Integration.TelemetryTest do
     def handle([:oban, :job, event], %{duration: duration}, meta, pid) do
       send(pid, {:event, event, duration, meta})
     end
+
+    def handle([:oban, :supervisor, :init] = event, measurements, meta, pid) do
+      send(pid, {:event, event, measurements, meta})
+    end
+  end
+
+  test "telemetry event is emitted for supervisor initialization" do
+    event = [:oban, :supervisor, :init]
+    :telemetry.attach("init-handler", event, &Handler.handle/4, self())
+
+    name = start_supervised_oban!(queues: [alpha: 2])
+    pid = Oban.Registry.whereis(name)
+    conf = Oban.config(name)
+
+    assert_receive {:event, [:oban, :supervisor, :init], %{system_time: _},
+                    %{conf: ^conf, pid: ^pid}}
+  after
+    :telemetry.detach("init-handler")
   end
 
   test "telemetry events are emitted for executed jobs" do
@@ -26,7 +44,7 @@ defmodule Oban.Integration.TelemetryTest do
 
     :telemetry.attach_many("job-handler", events, &Handler.handle/4, self())
 
-    start_supervised_oban!(queues: [alpha: 2])
+    name = start_supervised_oban!(queues: [alpha: 2])
 
     %Job{id: stop_id} = insert!([ref: 1, action: "OK"], tags: ["baz"])
     %Job{id: error_id} = insert!([ref: 2, action: "ERROR"], tags: ["foo"])
@@ -40,8 +58,12 @@ defmodule Oban.Integration.TelemetryTest do
     assert queue_time > 0
     assert error_duration > 0
 
+    assert %{conf: %Config{name: ^name}, job: %Job{id: ^stop_id}, result: :ok} = stop_meta
+    assert %{conf: %Config{name: ^name}, job: %Job{id: ^error_id}} = error_meta
+
+    # Deprecated Meta
+
     assert %{
-             job: %Job{id: ^stop_id},
              id: ^stop_id,
              args: %{},
              queue: "alpha",
@@ -49,11 +71,11 @@ defmodule Oban.Integration.TelemetryTest do
              prefix: "public",
              attempt: 1,
              max_attempts: 20,
+             state: :success,
              tags: ["baz"]
            } = stop_meta
 
     assert %{
-             job: %Job{id: ^error_id},
              id: ^error_id,
              args: %{},
              queue: "alpha",
@@ -64,6 +86,7 @@ defmodule Oban.Integration.TelemetryTest do
              kind: :error,
              error: %PerformError{},
              stacktrace: [],
+             state: :failure,
              tags: ["foo"]
            } = error_meta
   after

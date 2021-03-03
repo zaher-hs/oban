@@ -11,8 +11,7 @@ defmodule Oban do
   use Supervisor
 
   alias Ecto.{Changeset, Multi}
-  alias Oban.{Config, Job, Midwife, Notifier, Query, Registry}
-  alias Oban.Crontab.Scheduler
+  alias Oban.{Config, Job, Midwife, Notifier, Query, Registry, Telemetry}
   alias Oban.Queue.{Drainer, Producer}
   alias Oban.Queue.Supervisor, as: QueueSupervisor
 
@@ -37,26 +36,27 @@ defmodule Oban do
 
   @type option ::
           {:circuit_backoff, timeout()}
-          | {:crontab, [Config.cronjob()]}
           | {:dispatch_cooldown, pos_integer()}
           | {:get_dynamic_repo, nil | (() -> pid() | atom())}
           | {:log, false | Logger.level()}
           | {:name, name()}
           | {:node, binary()}
           | {:plugins, [module() | {module() | Keyword.t()}]}
-          | {:poll_interval, pos_integer()}
           | {:prefix, binary()}
           | {:queues, [{queue_name(), pos_integer() | Keyword.t()}]}
           | {:repo, module()}
           | {:shutdown_grace_period, timeout()}
-          | {:timezone, Calendar.time_zone()}
 
-  @type job_changeset :: Changeset.t(Job.t())
+  @type drain_option ::
+          {:queue, queue_name()}
+          | {:with_safety, boolean()}
+          | {:with_scheduled, boolean()}
 
-  @version Mix.Project.config()[:version]
+  @type drain_result :: %{failure: non_neg_integer(), success: non_neg_integer()}
 
-  @doc false
-  def version, do: @version
+  @type wrapper :: %{:changesets => Job.changeset_list(), optional(atom()) => term()}
+
+  @type changesets_or_wrapper :: Job.changeset_list() | wrapper()
 
   @doc """
   Starts an `Oban` supervision tree linked to the current process.
@@ -72,34 +72,31 @@ defmodule Oban do
 
   These options determine what the system does at a high level, i.e. which queues to run.
 
-  * `:crontab` — a list of cron expressions that enqueue jobs on a periodic basis. See "Periodic
-    (CRON) Jobs" in the module docs.
-
-    For testing purposes `:crontab` may be set to `false` or `nil`, which disables scheduling.
   * `:node` — used to identify the node that the supervision tree is running in. If no value is
     provided it will use the `node` name in a distributed system, or the `hostname` in an isolated
     node. See "Node Name" below.
+
+  * `:plugins` — a list or modules or module/option tuples that are started as children of an Oban
+    supervisor. Any supervisable module is a valid plugin, i.e. a `GenServer` or an `Agent`.
+
   * `:prefix` — the query prefix, or schema, to use for inserting and executing jobs. An
     `oban_jobs` table must exist within the prefix. See the "Prefix Support" section in the module
     documentation for more details.
+
   * `:queues` — a keyword list where the keys are queue names and the values are the concurrency
     setting or a keyword list of queue options. For example, setting queues to `[default: 10,
     exports: 5]` would start the queues `default` and `exports` with a combined concurrency level
     of 15. The concurrency setting specifies how many jobs _each queue_ will run concurrently.
 
-    Queues accept additional override options to customize their behavior, e.g. by setting the
-    `poll_interval` and the `dispatch_cooldown` for a specific queue.
+    Queues accept additional override options to customize their behavior, e.g. by setting
+    `paused` or `dispatch_cooldown` for a specific queue.
 
     For testing purposes `:queues` may be set to `false` or `nil`, which effectively disables all
     job dispatching.
-  * `:timezone` — which timezone to use when scheduling cron jobs. To use a timezone other than
-    the default of "Etc/UTC" you *must* have a timezone database like [tzdata][tzdata] installed
-    and configured.
+
   * `:log` — either `false` to disable logging or a standard log level (`:error`, `:warn`,
     `:info`, `:debug`). This determines whether queries are logged or not; overriding the repo's
     configured log level. Defaults to `false`, where no queries are logged.
-
-  [tzdata]: https://hexdocs.pm/tzdata
 
   ### Twiddly Options
 
@@ -109,6 +106,7 @@ defmodule Oban do
   * `:circuit_backoff` — the number of milliseconds until queries are attempted after a database
     error. All processes communicating with the database are equipped with circuit breakers and
     will use this for the backoff. Defaults to `30_000ms`.
+
   * `:dispatch_cooldown` — the minimum number of milliseconds a producer will wait before fetching
     and running more jobs. A slight cooldown period prevents a producer from flooding with
     messages and thrashing the database. The cooldown period _directly impacts_ a producer's
@@ -118,9 +116,7 @@ defmodule Oban do
 
     The default is `5ms` and the minimum is `1ms`, which is likely faster than the database can
     return new jobs to run.
-  * `:poll_interval` - the number of milliseconds between polling for new jobs in a queue. This
-    is directly tied to the resolution of _scheduled_ jobs. For example, with a `poll_interval` of
-    `5_000ms`, scheduled jobs are checked every 5 seconds. The default is `1_000ms`.
+
   * `:shutdown_grace_period` - the amount of time a queue will wait for executing jobs to complete
     before hard shutdown, specified in milliseconds. The default is `15_000`, or 15 seconds.
 
@@ -178,12 +174,13 @@ defmodule Oban do
   def init(%Config{plugins: plugins, queues: queues} = conf) do
     children = [
       {Notifier, conf: conf, name: Registry.via(conf.name, Notifier)},
-      {Midwife, conf: conf, name: Registry.via(conf.name, Midwife)},
-      {Scheduler, conf: conf, name: Registry.via(conf.name, Scheduler)}
+      {Midwife, conf: conf, name: Registry.via(conf.name, Midwife)}
     ]
 
     children = children ++ Enum.map(plugins, &plugin_child_spec(&1, conf))
     children = children ++ Enum.map(queues, &QueueSupervisor.child_spec(&1, conf))
+
+    execute_init(conf)
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -201,6 +198,13 @@ defmodule Oban do
 
   defp plugin_child_spec(module, conf) do
     plugin_child_spec({module, []}, conf)
+  end
+
+  defp execute_init(conf) do
+    measurements = %{system_time: System.system_time()}
+    metadata = %{pid: self(), conf: conf}
+
+    Telemetry.execute([:oban, :supervisor, :init], measurements, metadata)
   end
 
   @doc """
@@ -229,8 +233,8 @@ defmodule Oban do
       {:ok, job} = Oban.insert(MyApp.Worker.new(%{id: 1}, unique: [period: 30]))
   """
   @doc since: "0.7.0"
-  @spec insert(name(), job_changeset()) ::
-          {:ok, Job.t()} | {:error, job_changeset()} | {:error, term()}
+  @spec insert(name(), Job.changeset()) ::
+          {:ok, Job.t()} | {:error, Job.changeset()} | {:error, term()}
   def insert(name \\ __MODULE__, %Changeset{} = changeset) do
     name
     |> config()
@@ -257,7 +261,7 @@ defmodule Oban do
           name,
           multi :: Multi.t(),
           multi_name :: Multi.name(),
-          changeset_or_fun :: job_changeset() | fun()
+          changeset_or_fun :: Job.changeset() | Job.changeset_fun()
         ) :: Multi.t()
   def insert(name \\ __MODULE__, multi, multi_name, changeset_or_fun)
 
@@ -281,7 +285,7 @@ defmodule Oban do
       job = Oban.insert!(MyApp.Worker.new(%{id: 1}))
   """
   @doc since: "0.7.0"
-  @spec insert!(name(), job_changeset()) :: Job.t()
+  @spec insert!(name(), Job.changeset()) :: Job.t()
   def insert!(name \\ __MODULE__, %Changeset{} = changeset) do
     case insert(name, changeset) do
       {:ok, job} ->
@@ -291,7 +295,7 @@ defmodule Oban do
         raise Ecto.InvalidChangesetError, action: :insert, changeset: changeset
 
       {:error, reason} ->
-        raise RuntimeError, reason
+        raise RuntimeError, inspect(reason)
     end
   end
 
@@ -313,10 +317,7 @@ defmodule Oban do
       |> Oban.insert_all()
   """
   @doc since: "0.9.0"
-  @spec insert_all(
-          name(),
-          changesets_or_wrapper :: [job_changeset()] | %{changesets: [job_changeset()]}
-        ) :: [Job.t()]
+  @spec insert_all(name(), changesets_or_wrapper()) :: [Job.t()]
   def insert_all(name \\ __MODULE__, changesets_or_wrapper)
 
   def insert_all(name, %{changesets: [_ | _] = changesets}) do
@@ -336,7 +337,7 @@ defmodule Oban do
 
   ## Example
 
-      changesets = Enum.map(0..100, MyApp.Worker.new(%{id: &1}))
+      changesets = Enum.map(0..100, &MyApp.Worker.new(%{id: &1}))
 
       Ecto.Multi.new()
       |> Oban.insert_all(:jobs, changesets)
@@ -347,7 +348,7 @@ defmodule Oban do
           name(),
           multi :: Multi.t(),
           multi_name :: Multi.name(),
-          changesets_or_wrapper :: [job_changeset()] | %{changesets: [job_changeset()]}
+          changesets_or_wrapper() | Job.changeset_list_fun()
         ) :: Multi.t()
   def insert_all(name \\ __MODULE__, multi, multi_name, changesets_or_wrapper)
 
@@ -355,7 +356,8 @@ defmodule Oban do
     insert_all(name, multi, multi_name, changesets)
   end
 
-  def insert_all(name, %Multi{} = multi, multi_name, changesets) when is_list(changesets) do
+  def insert_all(name, %Multi{} = multi, multi_name, changesets)
+      when is_list(changesets) or is_function(changesets, 1) do
     name
     |> config()
     |> Query.insert_all_jobs(multi, multi_name, changesets)
@@ -414,7 +416,7 @@ defmodule Oban do
       assert_raise RuntimeError, fn -> Oban.drain_queue(queue: :risky, with_safety: false) end
   """
   @doc since: "0.4.0"
-  @spec drain_queue(name(), [Drainer.drain_option()]) :: Drainer.drain_result()
+  @spec drain_queue(name(), [drain_option()]) :: drain_result()
   def drain_queue(name \\ __MODULE__, [_ | _] = opts) do
     name
     |> config()
@@ -622,7 +624,7 @@ defmodule Oban do
       %{
         limit: 10,
         node: "me@local",
-        none: "a1b2c3d4",
+        nonce: "a1b2c3d4",
         paused: false,
         queue: "default",
         running: [100, 102],
@@ -678,9 +680,8 @@ defmodule Oban do
   def cancel_job(name \\ __MODULE__, job_id) when is_integer(job_id) do
     conf = config(name)
 
-    with :ignored <- Query.cancel_job(conf, job_id) do
-      Notifier.notify(conf, :signal, %{action: :pkill, job_id: job_id})
-    end
+    Query.cancel_job(conf, job_id)
+    Notifier.notify(conf, :signal, %{action: :pkill, job_id: job_id})
   end
 
   defp scope_signal(conf, opts) do

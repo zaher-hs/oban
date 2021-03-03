@@ -2,6 +2,21 @@ defmodule Oban.Telemetry do
   @moduledoc """
   Telemetry integration for event metrics, logging and error reporting.
 
+  ### Initialization Events
+
+  Oban emits the following telemetry event when an Oban supervisor is started:
+
+  * `[:oban, :supervisor, :init]` - when the Oban supervisor is started this will execute
+
+  The initialization event contains the following measurements:
+
+  * `:system_time` - The system's time when Oban was started
+
+  The initialization event contains the following metadata:
+
+  * `:conf` - The configuration used for the Oban supervisor instance
+  * `:pid` - The PID of the supervisor instance
+
   ### Job Events
 
   Oban emits the following telemetry events for each job:
@@ -14,11 +29,18 @@ defmodule Oban.Telemetry do
   provide the error type, the error itself, and the stacktrace. The following chart shows which
   metadata you can expect for each event:
 
-  | event        | measures                   | metadata                                                                                                  |
-  | ------------ | -------------------------- | ------------------------------------------- |
-  | `:start`     | `:system_time`             | `:job, :prefix`                             |
-  | `:stop`      | `:duration`, `:queue_time` | `:job, :prefix`                             |
-  | `:exception` | `:duration`, `:queue_time` | `:job, :prefix, :kind, :error, :stacktrace` |
+  | event        | measures                   | metadata                                          |
+  | ------------ | -------------------------- | ------------------------------------------------- |
+  | `:start`     | `:system_time`             | `:job, :conf, :state`                             |
+  | `:stop`      | `:duration`, `:queue_time` | `:job, :conf, :state, :result`                    |
+  | `:exception` | `:duration`, `:queue_time` | `:job, :conf, :state, :kind, :error, :stacktrace` |
+
+  Metadata
+
+  * `:conf` — the config of the Oban supervised producer
+  * `:job` — the executing `Oban.Job`
+  * `:state` — one of `:success`, `:discard` or `:snoozed`
+  * `:result` — the `perform/1` return value, only included when the state is `:success`
 
   For `:exception` events the metadata includes details about what caused the failure. The `:kind`
   value is determined by how an error occurred. Here are the possible kinds:
@@ -33,19 +55,19 @@ defmodule Oban.Telemetry do
 
   Oban emits the following telemetry span events for each queue's producer:
 
-  * `[:oban, :producer, :start | :stop | :exception]` — when a producer deschedules or dispatches
-    new jobs
+  * `[:oban, :producer, :start | :stop | :exception]` — when a producer dispatches new jobs
 
-  | event        | measures       | metadata          |
-  | ------------ | -------------- | ----------------- |
-  | `:start`     | `:system_time` | `:action, :queue` |
-  | `:stop`      | `:duration`    | `:action, :queue` |
-  | `:exception` | `:duration`    | `:action, :queue` |
+  | event        | measures       | metadata                           |
+  | ------------ | -------------- | ---------------------------------- |
+  | `:start`     | `:system_time` | `:queue, :conf`                    |
+  | `:stop`      | `:duration`    | `:queue, :conf, :dispatched_count` |
+  | `:exception` | `:duration`    | `:queue, :conf`                    |
 
   Metadata
 
-  * `:action` — one of `:deschedule` or `:dispatch`
   * `:queue` — the name of the queue as a string, e.g. "default" or "mailers"
+  * `:conf` — the config of the Oban supervised producer
+  * `:dispatched_count` — the number of jobs fetched and started by the producer
 
   ### Circuit Events
 
@@ -53,10 +75,10 @@ defmodule Oban.Telemetry do
   crashing the entire supervision tree. Processes emit a `[:oban, :circuit, :trip]` event when a
   circuit is tripped and `[:oban, :circuit, :open]` when the breaker is subsequently opened again.
 
-  | event                      | measures | metadata                               |
-  | -------------------------- | -------- | -------------------------------------- |
-  | `[:oban, :circuit, :trip]` |          | `:error, :message, :name, :stacktrace` |
-  | `[:oban, :circuit, :open]` |          | `:name`                                |
+  | event                      | measures | metadata                                      |
+  | -------------------------- | -------- | --------------------------------------------- |
+  | `[:oban, :circuit, :trip]` |          | `:error, :message, :name, :stacktrace, :conf` |
+  | `[:oban, :circuit, :open]` |          | `:name, :conf`                                |
 
   Metadata
 
@@ -64,6 +86,32 @@ defmodule Oban.Telemetry do
   * `:name` — the registered name of the process that tripped a circuit, i.e. `Oban.Notifier`
   * `:message` — a formatted error message describing what went wrong
   * `:stacktrace` — exception stacktrace, when available
+  * `:conf` — the config of the Oban supervisor that the producer is for
+
+  ### Plugin Events
+
+  All the Oban plugins emit telemetry events under the `[:oban, :plugin, *]` pattern (where `*` is
+  either `:start`, `:stop`, or `:exception`). You can filter out for plugin events by looking into
+  the metadata of the event and checking the value of `:plugin`. The `:plugin` key will contain the
+  module name of the plugin module that emitted the event. For example, to get `Oban.Plugins.Cron`
+  specific events, you can filter for telemetry events with a metadata key/value of
+  `plugin: Oban.Plugins.Cron`.
+
+  Oban emits the following telemetry event whenever a plugin executes (be sure to check the
+  documentation for each plugin as each plugin can also add additional metadata specific to
+  the plugin):
+
+  * `[:oban, :plugin, :start]` — when the plugin beings performing its work
+  * `[:oban, :plugin, :stop]` —  after the plugin completes its work
+  * `[:oban, :plugin, :exception]` — when the plugin encounters an error
+
+  The following chart shows which metadata you can expect for each event:
+
+  | event        | measures       | metadata                                     |
+  | ------------ | ---------------| ---------------------------------------------|
+  | `:start`     | `:system_time` | `:conf, :plugin`                             |
+  | `:stop`      | `:duration`    | `:conf, :plugin`                             |
+  | `:exception` | `:duration`    | `:error, :kind, :stacktrace, :conf, :plugin` |
 
   ## Default Logger
 
@@ -163,21 +211,7 @@ defmodule Oban.Telemetry do
     :telemetry.attach_many("oban-default-logger", events, &handle_event/4, level)
   end
 
-  @doc """
-  Measure and report `:start`, `:stop` and `:exception` events for a function.
-
-  ## Examples
-
-  Emit span timing events for a prune function:
-
-      :ok = Oban.Telemetry.span(:prune, &MyApp.Pruner.prune/0, %{extra: :data})
-
-  That will emit the following events:
-
-  * `[:oban, :prune, :start]` — before the function is invoked
-  * `[:oban, :prune, :stop]` — when the function completes successfully
-  * `[:oban, :prune, :exception]` — reported if the function throws, crashes or raises an error
-  """
+  @deprecated "Use the official :telemetry.span/3 instead"
   @spec span(name :: atom(), fun :: (() -> term()), meta :: map()) :: term()
   def span(name, fun, meta \\ %{}) when is_atom(name) and is_function(fun, 0) do
     start_time = System.system_time()

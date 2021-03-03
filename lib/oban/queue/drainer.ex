@@ -1,30 +1,24 @@
 defmodule Oban.Queue.Drainer do
   @moduledoc false
 
-  alias Oban.{Config, Query}
+  import Ecto.Query, only: [where: 3]
+
+  alias Oban.{Config, Job, Query, Repo}
   alias Oban.Queue.Executor
 
   @unlimited 100_000_000
-  @far_future DateTime.from_unix!(9_999_999_999)
+  @fake_nonce "draining"
 
-  @type drain_option ::
-          {:queue, binary() | atom()}
-          | {:with_scheduled, boolean()}
-          | {:with_safety, boolean()}
-
-  @type drain_result :: %{success: non_neg_integer(), failure: non_neg_integer()}
-
-  @spec drain(Config.t(), [drain_option()]) :: drain_result()
   def drain(%Config{} = conf, [_ | _] = opts) do
     queue =
       opts
       |> Keyword.fetch!(:queue)
       |> to_string()
 
-    if Keyword.get(opts, :with_scheduled, false), do: schedule_jobs(conf, queue)
+    if Keyword.get(opts, :with_scheduled, false), do: stage_scheduled(conf, queue)
 
     conf
-    |> fetch_jobs(queue)
+    |> fetch_available(queue)
     |> Enum.reduce(%{failure: 0, success: 0}, fn job, acc ->
       result =
         conf
@@ -36,12 +30,17 @@ defmodule Oban.Queue.Drainer do
     end)
   end
 
-  defp schedule_jobs(conf, queue) do
-    Query.stage_scheduled_jobs(conf, queue, max_scheduled_at: @far_future)
+  defp stage_scheduled(conf, queue) do
+    query =
+      Job
+      |> where([j], j.state in ["scheduled", "retryable"])
+      |> where([j], j.queue == ^queue)
+
+    Repo.update_all(conf, query, set: [state: "available"])
   end
 
-  defp fetch_jobs(conf, queue) do
-    {:ok, jobs} = Query.fetch_available_jobs(conf, queue, "draining", @unlimited)
+  defp fetch_available(conf, queue) do
+    {:ok, jobs} = Query.fetch_available_jobs(conf, queue, @fake_nonce, @unlimited)
 
     jobs
   end

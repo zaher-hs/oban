@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://github.com/sorentwo/oban">
-    <img alt="oban" src="https://raw.githubusercontent.com/sorentwo/oban/master/logotype.png" width="435">
+    <img alt="oban" src="https://raw.githubusercontent.com/sorentwo/oban/master/assets/oban-logotype-large.png" width="435">
   </a>
 </p>
 
@@ -118,7 +118,7 @@ orphaned due to crashes.
   These are used to monitor queue health across nodes and may be used for
   analytics.
 
-- **Queue Draining** — Queue shutdown is delayed so that slow jobs can finish
+- **Graceful Shutdown** — Queue shutdown is delayed so that slow jobs can finish
   executing before shutdown. When shutdown starts queues are paused and stop
   executing new jobs. Any jobs left running after the shutdown grace period may
   be rescued later.
@@ -130,17 +130,19 @@ orphaned due to crashes.
 [rdbms]: https://en.wikipedia.org/wiki/Relational_database#RDBMS
 [tele]: https://github.com/beam-telemetry/telemetry
 
-## Requirements
-
-Oban has been developed and actively tested with Elixir 1.8+, Erlang/OTP 21.1+
-and PostgreSQL 11.0+. Running Oban currently requires Elixir 1.8+, Erlang 21+,
-and PostgreSQL 9.6+.
-
 ## Oban Web+Pro
 
-A web-based user interface for managing Oban, along with an official set of
-plugins and workers are available as private packages. Learn more about Oban
-Web+Pro at [getoban.pro](https://getoban.pro).
+A web dashboard for managing Oban, along with an official set of plugins and
+workers are available as private packages.
+
+* [🧭 Web Overview](https://hexdocs.pm/oban/web_overview.html#content)
+* [🌟 Pro Overview](https://hexdocs.pm/oban/pro_overview.html#content)
+
+Learn more about licensing Oban Web+Pro at [getoban.pro](https://getoban.pro).
+
+## Requirements
+
+Running Oban requires Elixir 1.9+, Erlang 21+, and PostgreSQL 9.6+.
 
 ## Installation
 
@@ -150,7 +152,7 @@ dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:oban, "~> 2.3"}
+    {:oban, "~> 2.5.0"}
   ]
 end
 ```
@@ -246,7 +248,7 @@ defmodule MyApp.Application do
     Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
   end
 
-  # Conditionally disable crontab, queues, or plugins here.
+  # Conditionally disable queues or plugins here.
   defp oban_config do
     Application.get_env(:my_app, Oban)
   end
@@ -258,7 +260,7 @@ enqueueing scheduled jobs and job dispatching altogether when testing:
 
 ```elixir
 # config/test.exs
-config :my_app, Oban, crontab: false, queues: false, plugins: false
+config :my_app, Oban, queues: false, plugins: false
 ```
 
 See the installation instructions in the README or on the Hexdocs guide for details
@@ -279,7 +281,6 @@ You may also use an expanded form to configure queues with individual overrides:
 ```elixir
 queues: [
   default: 10,
-  mailers: [limit: 20, poll_interval: :timer.seconds(30)],
   events: [limit: 50, paused: true]
 ]
 ```
@@ -469,10 +470,11 @@ Job stats and queue introspection are built on keeping job rows in the database
 after they have completed. This allows administrators to review completed jobs
 and build informative aggregates, at the expense of storage and an unbounded
 table size. To prevent the `oban_jobs` table from growing indefinitely, Oban
-provides active pruning of `completed` and `discarded` jobs.
+provides active pruning of `completed`, `cancelled` and `discarded` jobs.
 
-By default, pruning retains jobs for 60 seconds. You can configure a longer
-retention period by providing a `max_age` in seconds to the `Pruner` plugin.
+By default, the `Pruner` plugin retains jobs for 60 seconds. You can configure a
+longer retention period by providing a `max_age` in seconds to the `Pruner`
+plugin.
 
 ```elixir
 # Set the max_age for 5 minutes
@@ -487,10 +489,9 @@ config :my_app, Oban,
   are soft; jobs beyond a specified age may not be pruned immediately after jobs
   complete.
 
-* Pruning is only applied to jobs that are `completed` or `discarded` (has
-  reached the maximum number of retries or has been manually killed). It'll
-  never delete a new job, a scheduled job or a job that failed and will be
-  retried.
+* Pruning is only applied to jobs that are `completed`, `cancelled` or
+  `discarded`. It'll never delete a new job, a scheduled job or a job that
+  failed and will be retried.
 
 ### Unique Jobs
 
@@ -512,9 +513,9 @@ level using the following options:
 
 * `:states` — The job states that are checked for duplicates. The available
   states are `:available`, `:scheduled`, `:executing`, `:retryable`,
-  `:completed` and `:discarded`. By default all states except for `:discarded`
-  are checked, which prevents duplicates even if the previous job has been
-  completed.
+  `:completed`, `:cancelled` and `:discarded`. By default all states except for
+  `:discarded` and `:cancelled` are checked, which prevents duplicates even if
+  the previous job has been completed.
 
 For example, configure a worker to be unique across all fields and states for 60
 seconds:
@@ -555,35 +556,34 @@ they _do not_ rely on unique constraints in the database. This makes uniqueness
 entirely configurable by application code, without the need for database
 migrations.
 
-#### Performance Note
-
-If your application makes heavy use of unique jobs you may want to add an index
-on the `args` column of the `oban_jobs` table. The other columns considered for
-uniqueness are already covered by indexes.
-
 ### Periodic Jobs
 
-Oban allows jobs to be registered with a cron-like schedule and enqueued
-automatically. Periodic jobs are registered as a list of `{cron, worker}` or
+Oban's `Cron` plugin registers workers a cron-like schedule and enqueues jobs
+automatically. Periodic jobs are declared as a list of `{cron, worker}` or
 `{cron, worker, options}` tuples:
 
 ```elixir
-config :my_app, Oban, repo: MyApp.Repo, crontab: [
-  {"* * * * *", MyApp.MinuteWorker},
-  {"0 * * * *", MyApp.HourlyWorker, args: %{custom: "arg"}},
-  {"0 0 * * *", MyApp.DailyWorker, max_attempts: 1},
-  {"0 12 * * MON", MyApp.MondayWorker, queue: :scheduled, tags: ["mondays"]},
-  {"@daily", MyApp.AnotherDailyWorker}
-]
+config :my_app, Oban,
+  repo: MyApp.Repo,
+  plugins: [
+    {Oban.Plugins.Cron,
+     crontab: [
+       {"* * * * *", MyApp.MinuteWorker},
+       {"0 * * * *", MyApp.HourlyWorker, args: %{custom: "arg"}},
+       {"0 0 * * *", MyApp.DailyWorker, max_attempts: 1},
+       {"0 12 * * MON", MyApp.MondayWorker, queue: :scheduled, tags: ["mondays"]},
+       {"@daily", MyApp.AnotherDailyWorker}
+     ]}
+  ]
 ```
 
-These jobs would be executed as follows:
+The crontab would insert jobs as follows:
 
-* `MyApp.MinuteWorker` — Executed once every minute
-* `MyApp.HourlyWorker` — Executed at the first minute of every hour with custom args
-* `MyApp.DailyWorker` — Executed at midnight every day with no retries
-* `MyApp.MondayWorker` — Executed at noon every Monday in the "scheduled" queue
-* `MyApp.AnotherDailyWorker` — Executed at midnight every day with no retries
+* `MyApp.MinuteWorker` — Inserted once every minute
+* `MyApp.HourlyWorker` — Inserted at the first minute of every hour with custom args
+* `MyApp.DailyWorker` — Inserted at midnight every day with no retries
+* `MyApp.MondayWorker` — Inserted at noon every Monday in the "scheduled" queue
+* `MyApp.AnotherDailyWorker` — Inserted at midnight every day with no retries
 
 The crontab format respects all [standard rules][cron] and has one minute
 resolution. Jobs are considered unique for most of each minute, which prevents
@@ -602,7 +602,7 @@ wildcards, step values or ranges:
 * `0` — Literal, matches only itself (only 0)
 * `*/15` — Step, matches any value that is a multiple (0, 15, 30, 45)
 * `0-5` — Range, matches any value within the range (0, 1, 2, 3, 4, 5)
-* `0-23/2` - Step values can be used in conjunction with ranges (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
+* `0-9/2` - Step values can be used in conjunction with ranges (0, 2, 4, 6, 8)
 
 Each part may have multiple rules, where rules are separated by a comma. The
 allowed values for each field are as follows:
@@ -630,15 +630,15 @@ Some specific examples that demonstrate the full range of expressions:
 * `0 7-9,4-6 13 * FRI` — Once an hour during both rush hours on Friday the 13th
 
 For more in depth information see the man documentation for `cron` and `crontab`
-in your system.  Alternatively you can experiment with various expressions
+in your system. Alternatively you can experiment with various expressions
 online at [Crontab Guru][guru].
 
 #### Caveats & Guidelines
 
-* All schedules are evaluated as UTC unless a different timezone is configured.
-  See `Oban.start_link/1` for information about configuring a timezone.
+* All schedules are evaluated as UTC unless a different timezone is provided.
+  See `Oban.Plugins.Cron` for information about configuring a timezone.
 
-* Workers can be used for regular and scheduled jobs so long as they accept
+* Workers can be used for regular _and_ scheduled jobs so long as they accept
   different arguments.
 
 * Duplicate jobs are prevented through transactional locks and unique
@@ -657,9 +657,14 @@ online at [Crontab Guru][guru].
     states: [:available, :scheduled, :executing]
   ]
 
-  config :my_app, Oban, repo: MyApp.Repo, crontab: [
-    {"* * * * *", MyApp.SlowWorker, args: custom_args, unique: unique_opts},
-  ]
+  config :my_app, Oban,
+    repo: MyApp.Repo,
+    plugins: [
+      {Oban.Plugins.Cron,
+       crontab: [
+         {"* * * * *", MyApp.SlowWorker, args: custom_args, unique: unique_opts}
+       ]}
+    ]
   ```
 
 [cron]: https://en.wikipedia.org/wiki/Cron#Overview
@@ -740,9 +745,6 @@ As noted in [Usage](#Usage), there are some guidelines for running tests:
   pruning queries will raise `DBConnection.OwnershipError` when the application
   boots.
 
-* Disable cron jobs via `crontab: false`. Periodic jobs aren't useful while
-  testing and scheduling can lead to random ownership issues.
-
 * Be sure to use the Ecto Sandbox for testing. Oban makes use of database pubsub
   events to dispatch jobs, but pubsub events never fire within a transaction.
   Since sandbox tests run within a transaction no events will fire and jobs
@@ -771,7 +773,7 @@ defmodule MyApp.BusinessTest do
   test "we stay in the business of doing business" do
     :ok = Business.schedule_a_meeting(%{email: "monty@brewster.com"})
 
-    assert %{success: 1, failure: 0} == Oban.drain_queue(queue: :mailer)
+    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :mailer)
 
     # Now, make an assertion about the email delivery
   end

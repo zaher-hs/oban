@@ -1,3 +1,7 @@
+if function_exported?(Code, :put_compiler_option, 2) do
+  Code.put_compiler_option(:warnings_as_errors, true)
+end
+
 Logger.configure(level: :warn)
 
 ExUnit.start()
@@ -46,11 +50,12 @@ defmodule Oban.Case do
       opts
       |> Keyword.put_new(:name, make_ref())
       |> Keyword.put_new(:repo, Repo)
-      |> Keyword.put_new(:poll_interval, 25)
       |> Keyword.put_new(:shutdown_grace_period, 1)
 
     name = opts[:name]
+
     start_supervised!({Oban, opts})
+
     name
   end
 
@@ -66,6 +71,12 @@ defmodule Oban.Case do
     args
     |> build(opts)
     |> Repo.insert!()
+  end
+
+  def insert!(oban, args, opts) do
+    changeset = build(args, opts)
+
+    Oban.insert!(oban, changeset)
   end
 
   def seconds_from_now(seconds) do

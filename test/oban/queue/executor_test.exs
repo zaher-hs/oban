@@ -11,18 +11,25 @@ defmodule Oban.Queue.ExecutorTest do
 
     @impl Worker
     def perform(%{args: %{"mode" => "ok"}}), do: :ok
+    def perform(%{args: %{"mode" => "result"}}), do: {:ok, :result}
     def perform(%{args: %{"mode" => "warn"}}), do: {:bad, :this_will_warn}
     def perform(%{args: %{"mode" => "raise"}}), do: raise(ArgumentError)
     def perform(%{args: %{"mode" => "catch"}}), do: throw(:no_reason)
     def perform(%{args: %{"mode" => "error"}}), do: {:error, "no reason"}
     def perform(%{args: %{"mode" => "sleep"}}), do: Process.sleep(10)
+    def perform(%{args: %{"mode" => "timed"}}), do: Process.sleep(10)
+
+    @impl Worker
+    def timeout(%{args: %{"mode" => "timed"}}), do: 20
+    def timeout(_), do: :infinity
   end
 
   @conf Config.new(repo: Repo)
 
   describe "perform/1" do
     test "accepting :ok as a success" do
-      assert %{state: :success} = call_with_mode("ok")
+      assert %{state: :success, result: :ok} = call_with_mode("ok")
+      assert %{state: :success, result: {:ok, :result}} = call_with_mode("result")
     end
 
     test "raising, catching and error tuples are failures" do
@@ -67,8 +74,17 @@ defmodule Oban.Queue.ExecutorTest do
       duration_ms = System.convert_time_unit(duration, :native, :millisecond)
       queue_time_ms = System.convert_time_unit(queue_time, :native, :millisecond)
 
-      assert_in_delta duration_ms, 10, 10
-      assert_in_delta queue_time_ms, 30, 10
+      assert_in_delta duration_ms, 10, 20
+      assert_in_delta queue_time_ms, 30, 20
+    end
+
+    test "tracking the pid of nested timed tasks" do
+      assert %{state: :success, result: :ok} = call_with_mode("timed")
+
+      assert [task_pid] = Process.get(:"$nested")
+
+      assert is_pid(task_pid)
+      assert task_pid != self()
     end
   end
 
