@@ -152,16 +152,16 @@ defmodule Oban.MixProject do
 
   defp deps do
     [
-      {:ecto_sql, ">= 3.4.3"},
+      {:ecto_sql, ">= 3.7.0"},
       {:jason, "~> 1.1"},
       {:postgrex, "~> 0.14"},
-      {:telemetry, "~> 0.4"},
+      {:telemetry, "~> 0.4.2"},
       {:stream_data, "~> 0.4", only: [:test, :dev]},
       {:tzdata, "~> 1.0", only: [:test, :dev]},
       {:benchee, "~> 1.0", only: [:test, :dev], runtime: false},
-      {:credo, "~> 1.4", only: [:test, :dev], runtime: false},
+      {:credo, "~> 1.5.6", only: [:test, :dev], runtime: false},
       {:dialyxir, "~> 1.0", only: [:test, :dev], runtime: false},
-      {:ex_doc, "~> 0.20", only: [:test, :dev], runtime: false}
+      {:ex_doc, "~> 0.25.2", only: [:test, :dev], runtime: false}
     ]
   end
 
